@@ -3632,12 +3632,14 @@ def _provider_for_host(base_url: str, table: tuple[tuple[str, str], ...]) -> Opt
 
 
 def _recoverable_pool_provider(
-    resolved_provider: str, client: Any, main_runtime: Optional[dict[str, Any]] = None
+    resolved_provider: str, client: Any, main_runtime: Optional[dict[str, Any]] = None,
+    *, infer_host: bool = True,
 ) -> Optional[str]:
     """Infer which provider pool can recover the current auxiliary client.
     None when the client targets a different host than the session's configured endpoint for that
     provider: a rejection there says nothing about the key, so rotating/quarantining it would kill a
-    working credential (Miho report — proxy users)."""
+    working credential (Miho report — proxy users). ``infer_host=False`` keeps an explicitly pinned
+    custom route from being mistaken for the global provider sharing its hostname."""
     normalized = _normalize_aux_provider(resolved_provider)
     base = str(getattr(client, "base_url", "") or "")
     runtime = _normalize_main_runtime(main_runtime)
@@ -3656,6 +3658,8 @@ def _recoverable_pool_provider(
         return None
     if normalized not in {"", "auto", "custom"}:  # a pinned ``custom:<name>`` keeps its entry's identity
         return pinned if (pinned := str(resolved_provider or "").strip().lower()).startswith("custom:") else normalized
+    if not infer_host:
+        return None
     known = _provider_for_host(base, _POOL_PROVIDER_BY_HOST)
     if known is not None:
         return known
@@ -3738,6 +3742,7 @@ def _prepare_same_provider_retry(
         retry_client, retry_model = _get_cached_client(
             resolved_provider, resolved_model, async_mode=async_mode, base_url=resolved_base_url,
             api_key=resolved_api_key, api_mode=resolved_api_mode, main_runtime=main_runtime,
+            task=task,
         )
         effective_provider = _effective_provider_for_client(retry_client, resolved_provider)
     if retry_client is None:
@@ -4058,15 +4063,21 @@ def _plan_fallback_auth_retry(
     rebuild: Callable[[str, Any, Optional[str]], tuple[_FallbackDestination, dict[str, Any]]], *,
     async_mode: bool,
     failed_api_key: str = "",
+    task: Optional[str] = None,
 ) -> tuple[str, Optional[tuple[Any, dict[str, Any], _FallbackDestination]]]:
     """After an auth error on a fallback candidate: refresh credentials and rebuild the request.
     Returns ``(refresh_provider, retry)``; ``retry`` = ``(client, kwargs, destination)`` or None."""
     fb_provider = _auth_refresh_provider_for_route(destination.provider, destination.base_url)
+    if _aux_task_requires_explicit_route(task):
+        # Fail-closed tasks never refresh a provider's OAuth grant or rotate a global pool
+        # for a fallback candidate: the dead candidate is quarantined and the operator's
+        # configured chain moves on to its next entry.
+        return fb_provider, None
     refresh_kwargs = {"failed_api_key": failed_api_key} if fb_provider == "anthropic" else {}
     if fb_provider not in {"auto", "", None} and _refresh_provider_credentials(fb_provider, **refresh_kwargs):
         retry_client, retry_model = _get_cached_client(
             fb_provider, destination.model, **({"async_mode": True} if async_mode else {}),
-            base_url=destination.base_url or None, api_mode=destination.api_mode,
+            base_url=destination.base_url or None, api_mode=destination.api_mode, task=task,
         )
         if retry_client is not None:
             retry_destination, retry_kwargs = rebuild(fb_provider, retry_client, retry_model)
@@ -4124,7 +4135,8 @@ def _call_fallback_candidate_sync(
                 reason=capacity)
             return None
         fb_provider, retry = _plan_fallback_auth_retry(
-            destination, rebuild, async_mode=False, failed_api_key=getattr(fb_client, "api_key", ""))
+            destination, rebuild, async_mode=False, failed_api_key=getattr(fb_client, "api_key", ""),
+            task=task)
         failed_destination = destination
         if retry is not None:
             failed_destination = retry[2]
@@ -4176,7 +4188,8 @@ async def _call_fallback_candidate_async(
                 tag=" (async)", reason=capacity)
             return None
         fb_provider, retry = _plan_fallback_auth_retry(
-            destination, rebuild, async_mode=True, failed_api_key=getattr(fb_client, "api_key", ""))
+            destination, rebuild, async_mode=True, failed_api_key=getattr(fb_client, "api_key", ""),
+            task=task)
         failed_destination = destination
         if retry is not None:
             failed_destination = retry[2]
@@ -4369,6 +4382,10 @@ def _try_configured_fallback_chain(
         fb_provider = str(entry.get("provider", "")).strip()
         if not fb_provider:
             continue
+        # Fail-closed tasks cannot treat a non-provider sentinel as an explicit candidate:
+        # "auto"/"main"/"custom:auto" would re-enter main-model/discovery routing.
+        if _aux_task_requires_explicit_route(task) and not _fail_closed_provider_route(fb_provider):
+            continue
         fb_model_raw = str(entry.get("model", "")).strip()
         fb_base_url = _custom_health_base_url(fb_provider, entry.get("base_url"))
         if skip(fb_provider, fb_model_raw, fb_base_url):
@@ -4380,7 +4397,10 @@ def _try_configured_fallback_chain(
         fb_model = fb_model_raw or None
         label = f"fallback_chain[{i}]({fb_provider})"
         try:
-            fb_client, resolved_model = _resolve_fallback_entry(entry)
+            if _aux_task_requires_explicit_route(task):
+                fb_client, resolved_model = _resolve_fallback_entry(entry, task=task)
+            else:
+                fb_client, resolved_model = _resolve_fallback_entry(entry)
         except Exception:
             fb_client, resolved_model = None, None
         if fb_client is not None:
@@ -4416,7 +4436,7 @@ def _fallback_entry_api_key(entry: dict[str, Any]) -> Optional[str]:
     return resolve_entry_api_key(entry)
 
 
-def _resolve_fallback_entry(entry: dict[str, Any]) -> tuple[Optional[Any], Optional[str]]:
+def _resolve_fallback_entry(entry: dict[str, Any], task: Optional[str] = None) -> tuple[Optional[Any], Optional[str]]:
     """Resolve one fallback entry through the central provider router."""
     provider = str(entry.get("provider") or "").strip()
     model = str(entry.get("model") or "").strip() or None
@@ -4426,6 +4446,7 @@ def _resolve_fallback_entry(entry: dict[str, Any]) -> tuple[Optional[Any], Optio
         provider, model=model, explicit_base_url=str(entry.get("base_url") or "").strip() or None,
         explicit_api_key=_fallback_entry_api_key(entry),
         api_mode=str(entry.get("api_mode") or entry.get("transport") or "").strip() or None,
+        **({"task": task} if task else {}),
     )
     if client is not None:
         with contextlib.suppress(Exception):
@@ -4471,7 +4492,10 @@ def _try_main_fallback_chain(
             tried.append(f"{label} (unhealthy)")
             continue
         try:
-            fb_client, resolved_model = _resolve_fallback_entry(entry)
+            if _aux_task_requires_explicit_route(task):
+                fb_client, resolved_model = _resolve_fallback_entry(entry, task=task)
+            else:
+                fb_client, resolved_model = _resolve_fallback_entry(entry)
         except Exception as exc:
             logger.debug("Auxiliary %s: main fallback %s failed to resolve: %s", task or "call", label, exc)
             fb_client, resolved_model = None, None
@@ -4584,12 +4608,85 @@ def _try_main_provider_route(
     return client, resolved or main_model, resolved_provider
 
 
+_FAIL_CLOSED_AUX_TASKS = frozenset({"approval"})
+
+
+def _aux_task_requires_explicit_route(task: Optional[str]) -> bool:
+    """Tasks whose call gates a trust decision may only use the operator's explicit
+    ``auxiliary.<task>`` provider and its own ``fallback_chain`` — never the main model,
+    auto-discovery, or payment fallbacks. Exhaustion surfaces the normal unavailable error,
+    which approval callers already interpret as escalation."""
+    return (task or "").strip().lower() in _FAIL_CLOSED_AUX_TASKS
+
+
+def _fail_closed_explicit_custom_route(route: Any) -> bool:
+    """A fail-closed task pinned to a custom/named endpoint. Hostname inference must not
+    swap those operator-supplied credentials for global (Nous) credentials."""
+    if not _aux_task_requires_explicit_route(getattr(route, "task", None)):
+        return False
+    provider = str(getattr(route, "resolved_provider", "") or "").strip().lower()
+    return provider == "custom" or provider.startswith("custom:")
+
+
+def _route_is_nous(route: Any) -> bool:
+    """True when the recovery ladder should run Nous-only credential rungs for this route.
+    Fail-closed tasks skip every global Nous recovery rung, even when the configured
+    destination happens to be the Nous host: an approval route must not have its
+    credentials refreshed or substituted for the global Portal's."""
+    if _aux_task_requires_explicit_route(getattr(route, "task", None)):
+        return False
+    if str(getattr(route, "resolved_provider", "") or "").strip().lower() == "nous":
+        return True
+    return base_url_host_matches(getattr(route, "base_info", "") or "",
+                                 "inference-api.nousresearch.com")
+
+
+def _fail_closed_sentinel_alias(provider: Optional[str]) -> bool:
+    """True for ``main`` / ``custom:auto`` / ``custom:main`` / ``custom:``: names that look
+    like an explicit route but normalize back into main-model or discovery routing."""
+    raw = (provider or "").strip().lower()
+    if raw == "main":
+        return True
+    if raw.startswith("custom:"):
+        return raw.split(":", 1)[1].strip() in {"", "auto", "main"}
+    return False
+
+
+def _fail_closed_sentinel_route(provider: Optional[str]) -> bool:
+    """Sentinel check that also follows the provider alias table."""
+    return _fail_closed_sentinel_alias(provider) or _fail_closed_sentinel_alias(
+        _normalize_aux_provider(provider))
+
+
+def _fail_closed_provider_route(provider: Optional[str]) -> bool:
+    """True when a configured provider names a concrete route rather than the
+    ``auto``/``main`` inheritance sentinel (checked before alias normalization)."""
+    raw = (provider or "").strip().lower()
+    if raw.startswith("custom:"):
+        raw = raw.split(":", 1)[1].strip()
+    return bool(raw) and raw not in {"auto", "main"}
+
+
+def _fail_closed_moa_route_ok(provider: Optional[str]) -> bool:
+    """True when a MoA-expanded aggregator names a concrete provider, not the
+    ``main``/``auto`` sentinel or an alias that normalizes back into it."""
+    raw = (provider or "").strip().lower()
+    if _fail_closed_sentinel_alias(raw):
+        return False
+    normalized = _normalize_aux_provider(raw)
+    if _fail_closed_sentinel_alias(normalized):
+        return False
+    return bool(normalized) and normalized not in {"auto", "main", "moa"}
+
+
 def _discovery_chain_allowed(main_provider: str, task: Optional[str] = None) -> bool:
     """The built-in discovery chain is a convenience for installs with NO selected main provider.
     Once the user picked one, every auxiliary route must be a provider they configured (main,
     ``auxiliary.<task>``, ``fallback_providers``); guessing "whatever else is logged in" bills an
     account they never pointed this session at (xAI OAuth session with a dead token → every
     compression silently charged to a Nous Portal balance)."""
+    if _aux_task_requires_explicit_route(task):
+        return False
     if (main_provider or "").strip().lower() in {"", "auto"}:
         return True
     logger.warning(
@@ -4630,20 +4727,28 @@ def _resolve_auto_route(
     main model, regardless of provider type ("auto" means "my main model for side tasks too"; explicit
     per-task overrides still win); (2) configured fallback policy — task chain, then the main agent's
     top-level chain; (3) OpenRouter → Nous → custom → Codex → API-key providers, only with no policy
-    and no working main client."""
+    and no working main client. Fail-closed tasks (``approval``) use only (2)'s task chain and never
+    fall through to the main model or discovery."""
     global auxiliary_is_nous
     auxiliary_is_nous = False  # Reset — _try_nous() will set True if it wins
     runtime = _normalize_main_runtime(main_runtime)
     _warn_stale_openai_base_url(runtime.get("provider", ""))
+    fail_closed = _aux_task_requires_explicit_route(task)
     main_provider, main_model, base_url, api_key, api_mode = _main_route_target(runtime, task)
-    routed = _try_main_provider_route(main_provider, main_model, base_url, api_key, api_mode)
-    if routed is not None:
-        return routed
+    if not fail_closed:
+        routed = _try_main_provider_route(main_provider, main_model, base_url, api_key, api_mode)
+        if routed is not None:
+            return routed
     if task:
         fb_client, fb_model, fb_label = _try_configured_fallback_chain(
-            task, main_provider or "auto", reason="main provider unavailable")
+            task, "auto" if fail_closed else (main_provider or "auto"),
+            reason="main provider unavailable")
         if fb_client is not None:
             return fb_client, fb_model, _fallback_provider_from_label(fb_label)
+    if fail_closed:
+        logger.warning("Auxiliary %s: no explicit provider or fallback_chain configured — "
+                       "refusing main-model/auto-discovery fallback", task)
+        return None, None, ""
     fb_client, fb_model, fb_label = _try_main_fallback_chain(
         task, main_provider or "auto", reason="main provider unavailable")
     if fb_client is not None:
@@ -5029,6 +5134,11 @@ def _resolve_xai_oauth_branch(req: _ResolveRequest) -> _ResolveResult:
 def _resolve_custom_branch(req: _ResolveRequest) -> _ResolveResult:
     """Custom endpoint (OPENAI_BASE_URL + OPENAI_API_KEY)."""
     provider, model, main_runtime = req.provider, req.model, req.main_runtime
+    if _aux_task_requires_explicit_route(req.task) and not str(req.explicit_base_url or "").strip():
+        # A fail-closed task must not inherit the main runtime's endpoint/key or fall through
+        # to generic custom/API-key discovery: bare "custom" with no base_url is not a route.
+        logger.warning("resolve_provider_client: task=%s requires an explicit custom base_url", req.task)
+        return None, None
     # wrap_base: base for the Anthropic-wrap decision. anthropic_messages must keep the raw
     # /anthropic base while the plain OpenAI client uses the /v1-rewritten custom_base (never
     # /anthropic/chat/completions). Empty means "use custom_base".
@@ -5050,7 +5160,10 @@ def _resolve_custom_branch(req: _ResolveRequest) -> _ResolveResult:
             custom_key = (
                 _normalize_api_key(req.explicit_api_key)
                 or _scoped_key_env("OPENAI_API_KEY")
-                or _read_main_api_key_if_same_origin(custom_base)
+                or (
+                    "" if _aux_task_requires_explicit_route(req.task)
+                    else _read_main_api_key_if_same_origin(custom_base)
+                )
                 or "no-key-required"  # local servers don't need auth
             )
         if not custom_base:
@@ -5070,8 +5183,15 @@ def _resolve_custom_branch(req: _ResolveRequest) -> _ResolveResult:
             from hermes_cli.auth import normalize_actual_base_url
             custom_base = normalize_actual_base_url(custom_base)
         final_model = _normalize_resolved_model(
-            model or (main_runtime.get("model") if main_runtime else None) or "gpt-4o-mini", provider,
+            model or (
+                None if _aux_task_requires_explicit_route(req.task) else
+                (main_runtime.get("model") if main_runtime else None) or "gpt-4o-mini"
+            ), provider,
         )
+        if _aux_task_requires_explicit_route(req.task) and not final_model:
+            logger.warning("resolve_provider_client: task=%s requires an explicit model for custom",
+                           req.task)
+            return None, None
         _clean_base, _dq = _extract_url_query_params(custom_base)
         extra = {"default_query": _dq} if _dq else {}
         from hermes_cli.config import get_custom_provider_extra_headers  # this endpoint's entry, as agent_init
@@ -5150,11 +5270,18 @@ def _resolve_named_custom_branch(req: _ResolveRequest) -> Optional[_ResolveResul
     final_model = _normalize_resolved_model(
         req.model
         or custom_entry.get("model")
-        or (req.main_runtime.get("model") if req.main_runtime else None)
-        or _read_main_model_for_aux()
-        or "gpt-4o-mini",
+        or (
+            None if _aux_task_requires_explicit_route(req.task) else
+            (req.main_runtime.get("model") if req.main_runtime else None)
+            or _read_main_model_for_aux()
+            or "gpt-4o-mini"
+        ),
         provider,
     )
+    if _aux_task_requires_explicit_route(req.task) and not final_model:
+        logger.warning("resolve_provider_client: task=%s requires an explicit model for %r",
+                       req.task, provider)
+        return None, None
     # An OpenCode-family entry (``opencode-go-bridge``, #85589) persisted the api_mode of whichever
     # model was selected at save time; the relay picks the wire per model (#98799).
     from agent.opencode_affinity import opencode_transport
@@ -5288,7 +5415,10 @@ def _resolve_external_process_branch(req: _ResolveRequest, creds: dict[str, Any]
     """PROVIDER_REGISTRY ``external_process`` providers, served via their registered profile."""
     provider = req.provider
     final_model = _normalize_resolved_model(
-        req.model or (req.main_runtime.get("model") if req.main_runtime else None) or _read_main_model_for_aux(),
+        req.model or (
+            None if _aux_task_requires_explicit_route(req.task) else
+            (req.main_runtime.get("model") if req.main_runtime else None) or _read_main_model_for_aux()
+        ),
         provider,
     )
     # Keyed on the registered profile, not a provider name, so an out-of-tree ACP provider reaches
@@ -5384,6 +5514,11 @@ def resolve_provider_client(
     # Keep the pre-alias name so a custom_providers entry named like a built-in alias
     # (e.g. "kimi" → "kimi-coding") is still reachable via the named-custom branch.
     original_provider = (provider or "").strip().lower()
+    if _aux_task_requires_explicit_route(task) and (_fail_closed_sentinel_alias(original_provider)
+                                                    or _fail_closed_sentinel_alias(provider)):
+        # main/custom:auto look explicit but normalize into main-model/discovery.
+        logger.warning("resolve_provider_client: task=%s refuses sentinel provider %r", task, original_provider)
+        return None, None
     provider = _normalize_aux_provider(provider)
     api_mode = _canonical_api_mode(str(api_mode or "")).lower() or None
     # MoA chokepoint: "moa" is not an HTTP provider; resolve to the aggregator so direct callers don't
@@ -5391,6 +5526,11 @@ def resolve_provider_client(
     if provider == "moa":
         _agg_provider, _agg_model = _resolve_moa_aggregator(model)
         if _agg_provider and _agg_model:
+            if _aux_task_requires_explicit_route(task) and not _fail_closed_moa_route_ok(_agg_provider):
+                # The preset's aggregator inherits main/auto: not an explicit route.
+                logger.warning("resolve_provider_client: task=%s refuses MoA aggregator %r",
+                               task, _agg_provider)
+                return None, None
             original_provider = _agg_provider.strip().lower()
             provider = _normalize_aux_provider(_agg_provider)
             model = _agg_model
@@ -5433,7 +5573,12 @@ def resolve_provider_client(
         # here wins over that. The main chat model is routinely text-only (e.g. a ``:free`` chat SKU), so
         # pre-filling it sends the image to a model that cannot accept one and the Portal 404s. Leave
         # ``model`` unset and let the Portal slot through; only an explicit caller model may override it.
-        model = _get_aux_model_for_provider(provider) or _read_main_model_for_aux() or model
+        if _aux_task_requires_explicit_route(task):
+            # Fail-closed tasks never inherit the main chat model; only an explicit caller/
+            # task model, a named provider's own model, or a provider default may be used.
+            model = _get_aux_model_for_provider(provider) or model
+        else:
+            model = _get_aux_model_for_provider(provider) or _read_main_model_for_aux() or model
     req = _ResolveRequest(
         provider, original_provider, model, async_mode, raw_codex,
         explicit_base_url, explicit_api_key, api_mode, main_runtime, is_vision, task,
@@ -5453,6 +5598,12 @@ def resolve_provider_client(
     if branch is not None:
         return branch(req)
     if provider == "azure-foundry":
+        if _aux_task_requires_explicit_route(task) and not req.model:
+            # Never let a trust-gating task silently use ``model.default`` (Azure's main
+            # deployment) when the caller supplied no deployment of its own.
+            logger.warning("resolve_provider_client: task=%s requires an explicit azure-foundry model",
+                           task)
+            return None, None
         return _resolve_azure_foundry_branch(req)
     return _resolve_registry_branch(req)
 
@@ -5464,7 +5615,7 @@ def get_text_auxiliary_client(task: str = "", *, main_runtime: Optional[dict[str
     provider, model, base_url, api_key, api_mode = _resolve_task_provider_model(task or None)
     return resolve_provider_client(
         provider, model=model, explicit_base_url=base_url, explicit_api_key=api_key,
-        api_mode=api_mode, main_runtime=main_runtime,
+        api_mode=api_mode, main_runtime=main_runtime, task=task or None,
     )
 
 
@@ -5743,8 +5894,11 @@ def _client_cache_key(
 ) -> tuple:
     runtime = _normalize_main_runtime(main_runtime)
     # `auto` resolves through the main runtime and task-specific policy, so both join the key.
+    # Fail-closed tasks also partition explicitly: a client prepared under ordinary policy must
+    # never be served to a trust-decision caller, even on the same provider/model.
     runtime_key = tuple(_runtime_cache_discriminator(f, runtime.get(f, "")) for f in _MAIN_RUNTIME_FIELDS) if provider == "auto" else ()
-    task_key = (task or "", _task_prefers_fast_model(task)) if provider == "auto" else ""
+    task_key = ((task or "", _task_prefers_fast_model(task))
+                if provider == "auto" or _aux_task_requires_explicit_route(task) else "")
     pool_hint = _pool_cache_hint(provider, main_runtime=main_runtime)
     # Model MUST be in the key: concurrent calls to the same endpoint with different models would
     # share an entry, and the second builder's _store_cached_client would close the first's client.
@@ -5973,6 +6127,11 @@ def _get_cached_client(
     previously occurred in long-running gateways where recycled worker threads created unbounded entries
     (#10200).
     """
+    if _aux_task_requires_explicit_route(task) and _fail_closed_sentinel_route(provider):
+        # Validate policy BEFORE any cache lookup: a sentinel provider normalizes into
+        # main-model/discovery routing and must never be served from a warmed entry.
+        logger.warning("_get_cached_client: task=%s refuses sentinel provider %r", task, provider)
+        return None, None
     # A bare llama.cpp alias keys on the live local endpoint: a restarted server (new port/key)
     # must not be served the old client, and a stopped one resolves to nothing, not a cloud client.
     from agent.auxiliary_local_runtime import bare_llamacpp_endpoint
@@ -6149,16 +6308,34 @@ def _resolve_task_provider_model(
     if cfg_model and cfg_model.lower() == "auto":
         cfg_model = None
     resolved_model = model or cfg_model
+    if _aux_task_requires_explicit_route(task):
+        # These spellings look like explicit routes but normalize into main-model/discovery;
+        # a fail-closed task may only continue through its own fallback_chain.
+        if _fail_closed_sentinel_alias(provider):
+            logger.warning("Auxiliary %s: refusing sentinel provider %r", task, provider)
+            provider = model = base_url = api_key = None
+        if _fail_closed_sentinel_alias(cfg_provider):
+            logger.warning("Auxiliary %s: refusing configured sentinel provider %r", task, cfg_provider)
+            cfg_provider = cfg_model = cfg_base_url = cfg_api_key = None
+        resolved_model = model or cfg_model
     # Any moa:// facade endpoint belongs to the facade, not the aggregator's real provider —
     # drop it (mirrors _resolve_auto_route()).
     if provider and str(provider).strip().lower() == "moa":
         provider, resolved_model = _unwrap_moa_provider(provider, resolved_model)
-        if provider and provider.lower() != "moa":
+        if _aux_task_requires_explicit_route(task) and not _fail_closed_moa_route_ok(provider):
+            logger.warning("Auxiliary %s: refusing MoA aggregator %r", task, provider)
+            provider = model = base_url = api_key = None
+            resolved_model = None
+        elif provider and provider.lower() != "moa":
             base_url = None
             api_key = None
     elif cfg_provider and str(cfg_provider).strip().lower() == "moa":
         cfg_provider, cfg_model = _unwrap_moa_provider(cfg_provider, resolved_model)
-        if cfg_provider and cfg_provider.lower() != "moa":
+        if _aux_task_requires_explicit_route(task) and not _fail_closed_moa_route_ok(cfg_provider):
+            logger.warning("Auxiliary %s: refusing configured MoA aggregator %r", task, cfg_provider)
+            cfg_provider = cfg_model = cfg_base_url = cfg_api_key = None
+            resolved_model = None
+        elif cfg_provider and cfg_provider.lower() != "moa":
             resolved_model = cfg_model
             cfg_base_url = None
             cfg_api_key = None
@@ -7699,9 +7876,11 @@ def _ladder_credential_rungs(
     """OAuth credential refresh + same-provider retry, then credential-pool rotation.
     Returns ``(response, None)`` or ``(None, first_err)`` to fall through."""
     client, task, tag, resolved_provider = route.client, route.task, route.tag, route.resolved_provider
+    fail_closed = _aux_task_requires_explicit_route(task)
     auth_refresh_provider = _auth_refresh_provider_for_route(
         resolved_provider, route.base_info, _effective_provider_for_client(client, ""))
-    if (_is_auth_error(first_err) and auth_refresh_provider not in {"auto", "", None}
+    if (_is_auth_error(first_err) and not fail_closed
+            and auth_refresh_provider not in {"auto", "", None}
             and not client_is_nous):
         refresh_kwargs = ({"failed_api_key": getattr(client, "api_key", "")}
                           if auth_refresh_provider == "anthropic" else {})
@@ -7723,7 +7902,11 @@ def _ladder_credential_rungs(
             # pool gate below and the ladder tail's eviction check both read this narrowed
             # value. An unclaimed failure (e.g. a 500) re-raised out of ``_rung`` above
             # instead, since the provider-fallback rung only acts on ``_FALLBACK_REASONS``.
-    pool_provider = _recoverable_pool_provider(resolved_provider, client, main_runtime=route.main_runtime)
+    # Fail-closed tasks never rotate a global credential pool (including one inferred from
+    # the host): the route's own credentials are all a trust decision may spend.
+    pool_provider = None if fail_closed else _recoverable_pool_provider(
+        resolved_provider, client, main_runtime=route.main_runtime,
+        infer_host=not _fail_closed_explicit_custom_route(route))
     # Capture the exact key used so recovery finds the right pool entry even if another
     # process rotated the pool meanwhile (current() would be None).
     _client_api_key = str(getattr(client, "api_key", "") or "")
@@ -7768,7 +7951,7 @@ def _next_fallback_after_quarantine(
     fb = _try_configured_fallback_chain(
         task, resolved_provider or "auto", reason=reason, failed_model=failed_model,
         failed_base_url=route.base_info, failure_scope=failure_scope)
-    if task_chain_only:
+    if task_chain_only or _aux_task_requires_explicit_route(task):
         return fb
     if fb[0] is None and is_auto:
         fb = _try_main_fallback_chain(
@@ -7807,7 +7990,9 @@ def _ladder_provider_fallback(first_err: Exception, route: _LadderRoute):
         # Mark the concrete backend (not the "auto" label) unhealthy so later aux calls skip
         # it instead of paying another doomed RTT.
         _mark_provider_unhealthy(
-            _recoverable_pool_provider(resolved_provider, route.client, main_runtime=route.main_runtime)
+            _recoverable_pool_provider(
+                resolved_provider, route.client, main_runtime=route.main_runtime,
+                infer_host=not _fail_closed_explicit_custom_route(route))
             or resolved_provider, base_url=route.base_info)
     if reason == "request timed out":
         # WARNING, naming the endpoint, the budget and the knob: the only other trace of a slow
@@ -7833,18 +8018,21 @@ def _ladder_provider_fallback(first_err: Exception, route: _LadderRoute):
     fb_client, fb_model, fb_label = _try_configured_fallback_chain(
         task, resolved_provider or "auto", reason=reason, failed_model=_chain_failed_model,
         failed_base_url=route.base_info, failure_scope=_chain_failure_scope)
-    if fb_client is None and is_auto:
-        fb_client, fb_model, fb_label = _try_main_fallback_chain(
-            task, resolved_provider or "auto", reason=reason, failed_model=_chain_failed_model,
-            failed_base_url=route.base_info, failure_scope=_chain_failure_scope)
-        if fb_client is None:
-            fb_client, fb_model, fb_label = _try_payment_fallback(
-                resolved_provider, task, reason=reason, failed_base_url=route.base_info,
-                failure_scope=_chain_failure_scope, main_runtime=route.main_runtime)
-    elif fb_client is None and not explicit_auth_with_task_chain:
-        fb_client, fb_model, fb_label = _try_main_agent_model_fallback(
-            resolved_provider, task, reason=reason, failed_model=_chain_failed_model,
-            failed_base_url=route.base_info, failure_scope=_chain_failure_scope)
+    # Fail-closed tasks stop at their own fallback_chain: the main agent model and the
+    # discovery/payment lanes are not candidates for a trust decision.
+    if fb_client is None and not _aux_task_requires_explicit_route(task):
+        if is_auto:
+            fb_client, fb_model, fb_label = _try_main_fallback_chain(
+                task, resolved_provider or "auto", reason=reason, failed_model=_chain_failed_model,
+                failed_base_url=route.base_info, failure_scope=_chain_failure_scope)
+            if fb_client is None:
+                fb_client, fb_model, fb_label = _try_payment_fallback(
+                    resolved_provider, task, reason=reason, failed_base_url=route.base_info,
+                    failure_scope=_chain_failure_scope, main_runtime=route.main_runtime)
+        elif not explicit_auth_with_task_chain:
+            fb_client, fb_model, fb_label = _try_main_agent_model_fallback(
+                resolved_provider, task, reason=reason, failed_model=_chain_failed_model,
+                failed_base_url=route.base_info, failure_scope=_chain_failure_scope)
     # Ordered walk: a candidate that returns None was quarantined (dead credential or a capacity
     # error such as a quota 429) and is now unhealthy, so re-walking the CONFIGURED chains first
     # lands on the next entry, then discovery where the selection policy allows it (#106367).
@@ -7895,8 +8083,7 @@ def _aux_recovery_ladder(
     resp, first_err, kwargs = yield from _ladder_parameter_rungs(first_err, route, kwargs, max_tokens)
     if first_err is None:
         return resp
-    client_is_nous = (resolved_provider == "nous"
-                      or base_url_host_matches(base_info, "inference-api.nousresearch.com"))
+    client_is_nous = _route_is_nous(route)
     resp, first_err = yield from _ladder_nous_rungs(first_err, route, kwargs, client_is_nous)
     if first_err is None:
         return resp
