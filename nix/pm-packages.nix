@@ -58,14 +58,13 @@ let
   # node segfaults on start (NixOS/patchelf#674). Fixed upstream by #672, not
   # yet released; drop this once nixpkgs ships a patchelf that contains it.
   patchelfFixed = patchelf.overrideAttrs (old: {
-    patches = (old.patches or [ ]) ++ [
-      (fetchpatch {
+    patches = (old.patches or [ ])
+      ++ lib.optional (old.version == "0.19.2") (fetchpatch {
         name = "patchelf-fix-executable-header-load-overlap.patch";
         url = "https://github.com/NixOS/patchelf/commit/59acc3d98b4961cfddf02090d9426ac735603218.patch";
         includes = [ "src/*" ];
         hash = "sha256-rQWWZlCa4IRrcPcxMD2xrTTD4nLOsWfdZLOk9UoIOIs=";
-      })
-    ];
+      });
   });
 
   derive = name: pin: artifacts:
